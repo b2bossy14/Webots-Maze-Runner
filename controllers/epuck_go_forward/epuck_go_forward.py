@@ -1,4 +1,5 @@
 from controller import Robot, Motor, Camera, RangeFinder
+from collections import deque
 
 TIME_STEP = 64
 MAX_SPEED = 6.28
@@ -31,6 +32,14 @@ rangeFinder.enable(TIME_STEP)
 RF_WIDTH = rangeFinder.getWidth()
 RF_HEIGHT = rangeFinder.getHeight()
 
+# ------------------ LEDs ------------------
+
+leds = []
+for i in range(10):
+    led = robot.getDevice(f'led{i}')
+    leds.append(led)
+
+
 # ------------------ maze state ------------------
 # 0 = north, 1 = east, 2 = south, 3 = west
 heading = 0
@@ -43,6 +52,9 @@ path_stack = [current_tile]
 unexplored_dirs = {}
 
 goal_tile = None
+
+graph = {}          # adjacency list
+start_tile = (0, 0)
 
 dir_names = ['N', 'E', 'S', 'W']
 
@@ -226,24 +238,106 @@ def update_unexplored_dirs(tile):
 
     turn_to_direction(original_heading)
 
+
+
+
+# --------------- LED helper ---------------
+def set_all_leds(value):
+    for led in leds:
+        led.set(value)
+
+def flash_all_leds_once():
+    set_all_leds(1)
+    for _ in range(6):   
+        robot.step(TIME_STEP)
+
+    set_all_leds(0)
+    for _ in range(2):
+        robot.step(TIME_STEP)
+
+# ------------------ graph / shortest path helpers ------------------
+def add_edge(a, b):
+    if a not in graph:
+        graph[a] = set()
+    if b not in graph:
+        graph[b] = set()
+    graph[a].add(b)
+    graph[b].add(a)
+
+def shortest_path(start, goal):
+    if start == goal:
+        return [start]
+    queue = deque([start])
+    came_from = {start: None}
+    while queue:
+        node = queue.popleft()
+        for neighbor in graph.get(node, []):
+            if neighbor not in came_from:
+                came_from[neighbor] = node
+                if neighbor == goal:
+                    path = []
+                    cur = neighbor
+                    while cur is not None:
+                        path.append(cur)
+                        cur = came_from[cur]
+                    path.reverse()
+                    return path
+                queue.append(neighbor)
+    return None
+
+def direction_between(a, b):
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
+    if dy == -1:
+        return 0  # N
+    elif dx == 1:
+        return 1  # E
+    elif dy == 1:
+        return 2  # S
+    else:
+        return 3  # W
+
+def path_to_directions(path):
+    directions = []
+    for i in range(len(path) - 1):
+        directions.append(direction_between(path[i], path[i + 1]))
+    return directions
+
+def directions_to_commands(directions):
+    if not directions:
+        return []
+    commands = []
+    current_dir = directions[0]
+    count = 1
+    for d in directions[1:]:
+        if d == current_dir:
+            count += 1
+        else:
+            commands.append((current_dir, count))
+            current_dir = d
+            count = 1
+    commands.append((current_dir, count))
+    return commands
+
+def execute_shortest_path(commands):
+    for direction, count in commands:
+        turn_to_direction(direction)
+        for _ in range(count):
+
+            # LED flash to indicate start - will flash after each step after but ignore that
+            flash_all_leds_once()
+
+            move_forward_one_tile()
+        print(f"Shortest path: moved {count} tiles {dir_names[direction]}")
+
 # ------------------ main loop ------------------
 while robot.step(TIME_STEP) != -1:
 
-    # record the green wall/tile of green wall but do not stop unless all 36 tiles have been explored
+    # record the green goal tile but let DFS continue to completion
     if sees_green():
         if goal_tile is None:
             goal_tile = current_tile
             print(f"GREEN FOUND at {goal_tile}")
-
-        if len(visited) >= TOTAL_TILES:
-            print("GREEN FOUND and all 36 tiles found")
-            leftMotor.setVelocity(0.5 * MAX_SPEED)
-            rightMotor.setVelocity(0.5 * MAX_SPEED)
-            while robot.step(TIME_STEP) != -1:
-                pass
-            break
-        else:
-            print(f"GREEN FOUND AT {current_tile}, only {len(visited)}/{TOTAL_TILES} tiles explored so must continue")
 
     update_unexplored_dirs(current_tile)
 
@@ -267,12 +361,16 @@ while robot.step(TIME_STEP) != -1:
             next_tile = tile_in_direction(current_tile, direction)
             unexplored_dirs[current_tile].remove(direction)
 
+            old_tile = current_tile
+
             turn_to_direction(direction)
             move_forward_one_tile()
 
             current_tile = next_tile
             visited.add(current_tile)
             path_stack.append(current_tile)
+
+            add_edge(old_tile, current_tile)
 
             print(f"MOVE -> {current_tile} ({dir_names[heading]})")
             print(f"Visited tiles: {len(visited)}/{TOTAL_TILES}")
@@ -285,7 +383,42 @@ while robot.step(TIME_STEP) != -1:
 
     # Backtracking logic --------------
     if len(path_stack) <= 1:
-        print("Done exploring")
+        print("====================================================================")
+        print("MAPPING PHASE COMPLETE")
+        print(f"Robot at: {current_tile}, heading: {dir_names[heading]}")
+        print(f"Tiles visited: {len(visited)}/{TOTAL_TILES}")
+        print(f"Graph edges: {sum(len(v) for v in graph.values()) // 2}")
+        print(f"Goal tile: {goal_tile}")
+        print("====================================================================")
+
+        if goal_tile is None:
+            print("ERROR: No green goal tile was found during exploration!")
+            stop()
+            break
+
+        path = shortest_path(start_tile, goal_tile)
+
+        if path is None:
+            print(f"ERROR: No path found from {start_tile} to {goal_tile}!")
+            stop()
+            break
+
+        print(f"SHORTEST PATH: {path}")
+
+        directions = path_to_directions(path)
+
+        commands = directions_to_commands(directions)
+
+
+
+        execute_shortest_path(commands)
+
+        print(f"Shortest path complete")
+
+        # drive straight into the green wall
+        turn_to_direction(heading)
+        move_forward_one_tile()
+
         stop()
         break
 
